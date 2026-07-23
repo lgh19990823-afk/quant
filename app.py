@@ -2,57 +2,96 @@ import streamlit as st
 import akshare as ak
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="量化推演终端", page_icon="📈", layout="centered")
+st.set_page_config(page_title="A股真实量化推演终端", layout="wide")
 
 st.title("📈 A股真实量化推演终端")
 st.caption("数据源：AkShare | 算法：20日真实ATR + 1万次蒙特卡洛模拟")
 
-stock_code = st.text_input("请输入 6 位 A 股代码", value="600519", max_chars=6)
+stock_code = st.text_input("请输入 6 位 A 股代码", value="002160")
 
-if st.button("🚀 开始量化计算", type="primary", use_container_width=True):
-    with st.spinner("正在抓取真实历史 K 线进行矩阵推演..."):
+def fetch_data(code):
+    prefix = "sh" if code.startswith("6") else "sz"
+    try:
+        df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}")
+        if df is not None and not df.empty:
+            df = df.rename(columns={
+                'date': '日期', 'open': '开盘', 'high': '最高', 
+                'low': '最低', 'close': '收盘', 'volume': '成交量'
+            })
+            df['日期'] = pd.to_datetime(df['日期'])
+            return df
+    except Exception:
+        pass
+    
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+    if df is not None and not df.empty:
+        df['日期'] = pd.to_datetime(df['日期'])
+    return df
+
+if st.button("🚀 开始量化计算"):
+    with st.spinner("正在拉取行情并计算推演数据..."):
         try:
-            end_date = datetime.now().strftime("%Y%m%d")
-            hist_df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date="20230101", end_date=end_date, adjust="qfq")
-
-            if hist_df.empty:
-                st.error("未查到该股票，请检查代码！")
+            hist_df = fetch_data(stock_code)
+            
+            if hist_df is None or hist_df.empty:
+                st.error("未能获取到该股票的行情数据，请检查代码是否正确。")
             else:
-                stock_name = hist_df['股票名称'].iloc[-1]
-                current_price = float(hist_df['收盘'].iloc[-1])
-
-                df_recent = hist_df.tail(20).copy()
-                df_recent['tr'] = np.maximum(
-                    df_recent['最高'] - df_recent['最低'],
-                    np.abs(df_recent['最高'] - df_recent['收盘'].shift(1))
-                )
-                atr_20 = df_recent['tr'].mean()
-
-                returns = np.log(hist_df['收盘'] / hist_df['收盘'].shift(1)).dropna().tail(60)
-                annual_vol = float(np.std(returns) * np.sqrt(252))
-
-                simulations, days, dt = 10000, 5, 1/252
-                Z = np.random.normal(0, 1, (simulations, days))
-                delta_returns = np.exp((-0.5 * (annual_vol ** 2) * dt) + (annual_vol * np.sqrt(dt) * Z))
-                final_prices = current_price * np.prod(delta_returns, axis=1)
-
-                gbm_win_rate = int((np.sum(final_prices > current_price) / simulations) * 100)
-                p5, p95 = np.percentile(final_prices, 5), np.percentile(final_prices, 95)
-
-                st.success(f"股票名称：{stock_name} ({stock_code})")
-
-                col1, col2 = st.columns(2)
-                col1.metric("最新价格", f"￥{current_price:.2f}")
-                col2.metric("20日真实波幅(ATR)", f"￥{atr_20:.2f}")
-
-                st.subheader("📊 未来 5 天概率推演 (10,000次模拟)")
-                col3, col4 = st.columns(2)
-                col3.metric("5日正期望胜率", f"{gbm_win_rate}%")
-                col4.metric("95%置信上轨", f"￥{p95:.2f}")
-
-                st.info(f"💡 动态防守位（止损点参考）：￥{current_price - 1.5 * atr_20:.2f}")
-
+                st.success("数据获取成功！")
+                
+                # 1. 计算 20日 ATR
+                high_low = hist_df['最高'] - hist_df['最低']
+                high_close = np.abs(hist_df['最高'] - hist_df['收盘'].shift(1))
+                low_close = np.abs(hist_df['最低'] - hist_df['收盘'].shift(1))
+                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                atr20 = tr.rolling(20).mean().iloc[-1]
+                
+                last_price = hist_df['收盘'].iloc[-1]
+                stop_loss = last_price - (2 * atr20)
+                
+                st.subheader("📊 波动率与止损位 (ATR)")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("当前收盘价", f"{last_price:.2f} 元")
+                col2.metric("20日 ATR 波动值", f"{atr20:.2f} 元")
+                col3.metric("推荐移动止损位 (2xATR)", f"{stop_loss:.2f} 元")
+                
+                # 2. 10000 次蒙特卡洛模拟 (5天)
+                returns = np.log(hist_df['收盘'] / hist_df['收盘'].shift(1)).dropna()
+                mu = returns.mean()
+                sigma = returns.std()
+                
+                n_simulations = 10000
+                n_days = 5
+                
+                simulated_end_prices = []
+                for _ in range(n_simulations):
+                    price_path = [last_price]
+                    for _ in range(n_days):
+                        drift = mu - (0.5 * sigma**2)
+                        shock = sigma * np.random.normal()
+                        price_next = price_path[-1] * np.exp(drift + shock)
+                        price_path.append(price_next)
+                    simulated_end_prices.append(price_path[-1])
+                
+                simulated_end_prices = np.array(simulated_end_prices)
+                
+                prob_up = (simulated_end_prices > last_price).mean() * 100
+                p50 = np.percentile(simulated_end_prices, 50)
+                p95 = np.percentile(simulated_end_prices, 95)
+                p5 = np.percentile(simulated_end_prices, 5)
+                
+                st.subheader("🎲 5日蒙特卡洛价格概率推演 (1万次模拟)")
+                col_a, col_b, col_c, col_d = st.columns(4)
+                col_a.metric("上涨概率", f"{prob_up:.1f}%")
+                col_b.metric("中位数预测价 (P50)", f"{p50:.2f} 元")
+                col_c.metric("乐观目标价 (P95)", f"{p95:.2f} 元")
+                col_d.metric("悲观底线价 (P5)", f"{p5:.2f} 元")
+                
+                st.line_chart(hist_df.set_index('日期')['收盘'].tail(60))
+                st.caption("注：以上推演仅供量化模型演示，不构成任何投资建议。")
+                
         except Exception as e:
             st.error(f"计算出错: {e}")
